@@ -1,0 +1,257 @@
+name: Build MoniVPN
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MoniVPN"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.moni.vpn"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.moni.vpn"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+                  isCoreLibraryDesugaringEnabled = true
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("com.wireguard.android:tunnel:1.0.20230706")
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:name=".App"
+                  android:label="MoniVPN"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/moni/vpn
+          cat > app/src/main/java/com/moni/vpn/App.kt <<'EOF'
+          package com.moni.vpn
+
+          import android.app.Application
+          import com.wireguard.android.backend.GoBackend
+          import com.wireguard.android.backend.Tunnel
+
+          class App : Application() {
+              lateinit var backend: GoBackend
+              var stateListener: ((Tunnel.State) -> Unit)? = null
+
+              val tunnel = object : Tunnel {
+                  override fun getName(): String = "monivpn"
+                  override fun onStateChange(newState: Tunnel.State) {
+                      stateListener?.invoke(newState)
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  backend = GoBackend(applicationContext)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/moni/vpn/MainActivity.kt <<'EOF'
+          package com.moni.vpn
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.TextView
+          import com.wireguard.android.backend.Tunnel
+          import com.wireguard.config.Config
+          import java.io.BufferedReader
+          import java.io.StringReader
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private lateinit var configText: EditText
+              private lateinit var button: Button
+              private lateinit var status: TextView
+              private val app get() = application as App
+              private val prefs by lazy { getSharedPreferences("monivpn", MODE_PRIVATE) }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  configText = findViewById(R.id.configText)
+                  button = findViewById(R.id.connectButton)
+                  status = findViewById(R.id.statusText)
+
+                  configText.setText(prefs.getString("config", ""))
+                  app.stateListener = { runOnUiThread { updateUi(it) } }
+                  updateUi(app.backend.getState(app.tunnel))
+
+                  button.setOnClickListener {
+                      prefs.edit().putString("config", configText.text.toString()).apply()
+                      val intent = VpnService.prepare(this)
+                      if (intent != null) startActivityForResult(intent, 1) else toggle()
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1 && resultCode == RESULT_OK) toggle()
+                  else if (requestCode == 1) status.text = "VPN izni verilmedi"
+              }
+
+              private fun toggle() {
+                  val text = configText.text.toString()
+                  thread {
+                      try {
+                          val current = app.backend.getState(app.tunnel)
+                          if (current == Tunnel.State.UP) {
+                              app.backend.setState(app.tunnel, Tunnel.State.DOWN, null)
+                          } else {
+                              val config = Config.parse(BufferedReader(StringReader(text)))
+                              app.backend.setState(app.tunnel, Tunnel.State.UP, config)
+                          }
+                          runOnUiThread { updateUi(app.backend.getState(app.tunnel)) }
+                      } catch (e: Exception) {
+                          runOnUiThread { status.text = "Hata: ${e.message}" }
+                      }
+                  }
+              }
+
+              private fun updateUi(state: Tunnel.State) {
+                  if (state == Tunnel.State.UP) {
+                      status.text = "Bağlı"
+                      button.text = "Bağlantıyı Kes"
+                  } else {
+                      status.text = "Bağlı değil"
+                      button.text = "Bağlan"
+                  }
+              }
+
+              override fun onDestroy() {
+                  app.stateListener = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="20dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="MoniVPN"
+                  android:textSize="28sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/statusText"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:text="Bağlı değil"
+                  android:textSize="16sp" />
+
+              <EditText
+                  android:id="@+id/configText"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:layout_marginTop="16dp"
+                  android:gravity="top"
+                  android:hint="WireGuard config'ini buraya yapıştır ([Interface] ve [Peer] bölümleri)"
+                  android:inputType="textMultiLine|textNoSuggestions"
+                  android:textSize="13sp" />
+
+              <Button
+                  android:id="@+id/connectButton"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:text="Bağlan" />
+          </LinearLayout>
+          EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MoniVPN-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
